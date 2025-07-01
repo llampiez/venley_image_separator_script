@@ -28,6 +28,3 @@ build/
 
 # Logs
 *.log
-
-# Project-specific output
-contenedor/*/imagenes_separadas/ 
