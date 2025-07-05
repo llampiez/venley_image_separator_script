@@ -2,4 +2,5 @@ opencv-python
 numpy
 tqdm
 pytest
-rawpy 
+rawpy
+Pillow 

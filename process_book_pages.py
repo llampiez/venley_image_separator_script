@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Tuple, Dict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
+from PIL import Image, ImageEnhance
 
 def load_image(filepath: Path) -> np.ndarray:
     """Loads an image from the specified file path, converting RAW formats if necessary."""
@@ -120,6 +121,54 @@ def crop_to_content(image: np.ndarray, padding: int = 20) -> np.ndarray:
     else:
         return image
 
+def enhance_page_quality(image: np.ndarray, sharpness: float = 1.3, contrast: float = 1.2, blur_kernel: int = 3) -> np.ndarray:
+    """
+    Enhances page quality by improving sharpness, contrast, and applying a subtle blur.
+    Optimized for book pages to improve text readability.
+    
+    Args:
+        image: Input image as numpy array (BGR format from OpenCV)
+        sharpness: Sharpness factor (1.0 = original, >1.0 = sharper)
+        contrast: Contrast factor (1.0 = original, >1.0 = more contrast)
+        blur_kernel: Gaussian blur kernel size (must be odd, 3 is subtle)
+    
+    Returns:
+        Enhanced image as numpy array (BGR format for OpenCV)
+    """
+    if image is None:
+        return None
+    
+    try:
+        # Convert BGR (OpenCV) to RGB (PIL)
+        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Convert to PIL Image
+        pil_image = Image.fromarray(rgb_image)
+        
+        # Enhance sharpness
+        enhancer = ImageEnhance.Sharpness(pil_image)
+        enhanced_image = enhancer.enhance(sharpness)
+        
+        # Enhance contrast
+        enhancer = ImageEnhance.Contrast(enhanced_image)
+        enhanced_image = enhancer.enhance(contrast)
+        
+        # Convert back to numpy array
+        enhanced_array = np.array(enhanced_image)
+        
+        # Apply subtle Gaussian blur to reduce noise
+        if blur_kernel > 0:
+            enhanced_array = cv2.GaussianBlur(enhanced_array, (blur_kernel, blur_kernel), 0)
+        
+        # Convert back to BGR for OpenCV
+        enhanced_bgr = cv2.cvtColor(enhanced_array, cv2.COLOR_RGB2BGR)
+        
+        return enhanced_bgr
+        
+    except Exception as e:
+        # If enhancement fails, return original image
+        return image
+
 def split_pages(image: np.ndarray, offset_percentage: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
     """
     Splits an image vertically into two pages. An offset can be applied to
@@ -155,10 +204,19 @@ def save_pages(left_page: np.ndarray, right_page: np.ndarray, output_dir: Path, 
     except Exception as e:
         raise IOError(f"Error saving pages for {filename}: {e}")
 
-def process_image(image_path: Path, output_dir: Path, logger: logging.Logger):
+def process_image(image_path: Path, output_dir: Path, logger: logging.Logger, 
+                  enhance_quality: bool = True, sharpness: float = 1.3, contrast: float = 1.2):
     """
     Processes an image using a two-phase cropping approach for best results.
-    Full pipeline: load -> rotate -> deskew -> coarse crop -> split -> fine crop -> save.
+    Full pipeline: load -> rotate -> deskew -> coarse crop -> split -> fine crop -> enhance -> save.
+    
+    Args:
+        image_path: Path to the input image
+        output_dir: Directory to save processed images
+        logger: Logger instance for error reporting
+        enhance_quality: Whether to apply quality enhancement (default: True)
+        sharpness: Sharpness factor for enhancement (default: 1.3)
+        contrast: Contrast factor for enhancement (default: 1.2)
     """
     try:
         # Steps 1 & 2: Load the image and correct its orientation
@@ -181,16 +239,33 @@ def process_image(image_path: Path, output_dir: Path, logger: logging.Logger):
         final_left_page = crop_to_content(left_page)
         final_right_page = crop_to_content(right_page)
 
-        # Step 7: Save the processed pages
-        save_pages(final_left_page, final_right_page, output_dir, image_path.name)
+        # Step 7: Enhance image quality for better text readability (optional)
+        if enhance_quality:
+            # Apply sharpness and contrast improvements optimized for book pages
+            enhanced_left_page = enhance_page_quality(final_left_page, sharpness=sharpness, contrast=contrast)
+            enhanced_right_page = enhance_page_quality(final_right_page, sharpness=sharpness, contrast=contrast)
+        else:
+            enhanced_left_page = final_left_page
+            enhanced_right_page = final_right_page
+
+        # Step 8: Save the processed pages
+        save_pages(enhanced_left_page, enhanced_right_page, output_dir, image_path.name)
         return True
     except Exception as e:
         logger.error(f"Failed to process {image_path.name}: {e}")
         return False
 
-def process_batch(batch_dir: Path, workers: int = 4) -> Dict[str, int]:
+def process_batch(batch_dir: Path, workers: int = 4, enhance_quality: bool = True, 
+                  sharpness: float = 1.3, contrast: float = 1.2) -> Dict[str, int]:
     """
     Processes a batch of images in parallel.
+    
+    Args:
+        batch_dir: Directory containing the batch to process
+        workers: Number of parallel workers to use
+        enhance_quality: Whether to apply quality enhancement
+        sharpness: Sharpness factor for enhancement
+        contrast: Contrast factor for enhancement
     """
     input_dir = batch_dir / "imagenes_juntas"
     output_dir = batch_dir / "imagenes_separadas"
@@ -220,7 +295,7 @@ def process_batch(batch_dir: Path, workers: int = 4) -> Dict[str, int]:
     error_count = 0
     
     with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(process_image, image_path, output_dir, logger): image_path for image_path in image_files}
+        futures = {executor.submit(process_image, image_path, output_dir, logger, enhance_quality, sharpness, contrast): image_path for image_path in image_files}
         
         with tqdm(total=len(image_files), desc=f"Processing Batch: {batch_dir.name}") as pbar:
             for future in as_completed(futures):
@@ -242,16 +317,29 @@ def main() -> None:
     
     Usage:
     
-    Process a single batch:
+    Process a single batch with quality enhancement (default):
     python process_book_pages.py --path /path/to/contenedor/lote_X
     
     Process all batches in the container:
     python process_book_pages.py --path /path/to/contenedor
+    
+    Process without quality enhancement:
+    python process_book_pages.py --path /path/to/contenedor/lote_X --no-enhance
+    
+    Process with custom quality settings:
+    python process_book_pages.py --path /path/to/contenedor/lote_X --sharpness 1.5 --contrast 1.3
     """
     parser = argparse.ArgumentParser(description="Batch process book page images.")
     parser.add_argument("--path", type=Path, required=True, help="Path to a batch directory or a container of batches.")
     parser.add_argument("--workers", type=int, default=os.cpu_count(), help="Number of worker processes to use.")
+    parser.add_argument("--enhance", action="store_true", default=True, help="Enable quality enhancement (default: True).")
+    parser.add_argument("--no-enhance", action="store_true", help="Disable quality enhancement.")
+    parser.add_argument("--sharpness", type=float, default=1.3, help="Sharpness factor for enhancement (default: 1.3).")
+    parser.add_argument("--contrast", type=float, default=1.2, help="Contrast factor for enhancement (default: 1.2).")
     args = parser.parse_args()
+    
+    # Handle enhance/no-enhance logic
+    enhance_quality = args.enhance and not args.no_enhance
 
     if not args.path.exists():
         print(f"Error: The path {args.path} does not exist.")
@@ -262,14 +350,14 @@ def main() -> None:
     
     if args.path.name.startswith("lote_"):
         # Process a single batch
-        stats = process_batch(args.path, args.workers)
+        stats = process_batch(args.path, args.workers, enhance_quality, args.sharpness, args.contrast)
         total_processed += stats["processed"]
         total_errors += stats["errors"]
     else:
         # Process all batches in the container
         batch_dirs = [d for d in args.path.iterdir() if d.is_dir() and d.name.startswith("lote_")]
         for batch_dir in batch_dirs:
-            stats = process_batch(batch_dir, args.workers)
+            stats = process_batch(batch_dir, args.workers, enhance_quality, args.sharpness, args.contrast)
             total_processed += stats["processed"]
             total_errors += stats["errors"]
             

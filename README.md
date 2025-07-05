@@ -12,6 +12,7 @@ Este proyecto contiene un script de Python diseñado para automatizar el procesa
   1.  **Recorte Global:** Aísla el libro del fondo (ej. la mesa).
   2.  **Recorte Fino:** Recorta cada página individualmente para eliminar los márgenes y dejar solo el texto.
 - **División de Páginas:** Separa la imagen del libro abierto en dos archivos, uno para la página izquierda y otro para la derecha.
+- **Mejora de Calidad:** Aplica mejoras automáticas de nitidez y contraste para optimizar la legibilidad del texto.
 - **Procesamiento Paralelo:** Utiliza múltiples núcleos del procesador para acelerar el trabajo significativamente.
 - **Registro de Errores:** Guarda un registro de cualquier imagen que no se pudo procesar en un archivo `errors.log` dentro de cada lote.
 
@@ -47,15 +48,16 @@ Sigue estos pasos para preparar el entorno y dejar el script listo para funciona
 3.  **Activar el Entorno Virtual**
     En la misma terminal, activa el entorno.
 
-    - **En Windows:**
-      ```powershell
-      .\venv\Scripts\activate
-      ```
-    - **En macOS/Linux:**
-      `bash
-source venv/bin/activate
-`
-      Verás `(venv)` al principio de la línea de tu terminal si se activó correctamente.
+        - **En Windows:**
+          ```powershell
+          .\venv\Scripts\activate
+          ```
+        - **En macOS/Linux:**
+          ```bash
+          source venv/bin/activate
+          ```
+
+    Verás `(venv)` al principio de la línea de tu terminal si se activó correctamente.
 
 4.  **Instalar las Dependencias**
     Con el entorno activado, instala todas las librerías necesarias ejecutando:
@@ -69,24 +71,36 @@ source venv/bin/activate
 
 1.  **Coloca tus Imágenes:** Añade todas las fotos que quieras procesar dentro de la carpeta `contenedor/lote_1/imagenes_juntas/`. Puedes crear más carpetas de lotes si lo necesitas (ej. `lote_2`).
 
-2.  **Ejecuta el Script:** Desde la terminal (con el entorno virtual activado), puedes ejecutar el script de dos maneras:
+2.  **Ejecuta el Script:** Desde la terminal (con el entorno virtual activado), puedes ejecutar el script de varias maneras:
 
-    - **Para procesar un único lote (ej. `lote_1`):**
+    - **Para procesar un único lote con mejora de calidad (por defecto):**
 
       ```bash
       python process_book_pages.py --path contenedor/lote_1
       ```
 
-    - **Para procesar todos los lotes (`lote_*`) que se encuentren dentro de `contenedor`:**
+    - **Para procesar todos los lotes que se encuentren dentro de `contenedor`:**
+
       ```bash
       python process_book_pages.py --path contenedor
+      ```
+
+    - **Para procesar sin mejora de calidad:**
+
+      ```bash
+      python process_book_pages.py --path contenedor/lote_1 --no-enhance
+      ```
+
+    - **Para procesar con configuración personalizada de mejora de calidad:**
+      ```bash
+      python process_book_pages.py --path contenedor/lote_1 --sharpness 1.5 --contrast 1.3
       ```
 
 3.  **Revisa los Resultados:** El script mostrará una barra de progreso. Cuando termine, encontrarás las imágenes de las páginas izquierda y derecha, corregidas y recortadas, dentro de la carpeta `imagenes_separadas` del lote correspondiente.
 
 ## Cómo Funciona el Procesamiento
 
-Cada imagen pasa por un pipeline de 7 pasos para asegurar la máxima calidad en el resultado:
+Cada imagen pasa por un pipeline de 8 pasos para asegurar la máxima calidad en el resultado:
 
 1.  **Carga:** Se carga la imagen (RAW o JPG).
 2.  **Giro 180°:** Se corrige la orientación si está de cabeza.
@@ -94,7 +108,8 @@ Cada imagen pasa por un pipeline de 7 pasos para asegurar la máxima calidad en 
 4.  **Recorte Global:** Se elimina el fondo (la mesa) para aislar solo el libro.
 5.  **División:** Se divide el libro en página izquierda y derecha, con un ligero desplazamiento para evitar el lomo.
 6.  **Recorte Fino:** Se recorta cada página para eliminar márgenes y dejar solo el texto.
-7.  **Guardado:** Se guardan las dos páginas finales como archivos JPG.
+7.  **Mejora de Calidad:** Se aplican mejoras de nitidez y contraste para optimizar la legibilidad del texto.
+8.  **Guardado:** Se guardan las dos páginas finales como archivos JPG.
 
 ## Pruebas
 
