@@ -28,3 +28,6 @@ build/
 
 # Logs
 *.log
+
+# Project-specific data and output
+contenedor/
