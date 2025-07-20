@@ -111,37 +111,73 @@ def deskew_image(image: np.ndarray, threshold: float = 1.0) -> np.ndarray:
     
     return image
 
-def crop_to_content(image: np.ndarray, padding: int = 20) -> np.ndarray:
+def crop_to_content(image: np.ndarray, padding: int = 20, min_area_ratio: float = 0.3) -> np.ndarray:
     """
-    Finds the largest bright object (the page) and crops the image to its
-    bounding box, leaving a small padding. This is effective at removing
-    dark backgrounds like a table.
+    Improved version that finds the largest bright object (the page) and crops the image to its
+    bounding box, leaving a small padding. Uses multiple thresholding methods for robustness.
     """
     if image is None:
         return None
 
+    original_area = image.shape[0] * image.shape[1]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    # Use a larger blur kernel to smooth out text and focus on the page shape
-    blurred = cv2.GaussianBlur(gray, (11, 11), 0)
-
-    # Use Otsu's thresholding to automatically separate the bright page from the dark background
-    try:
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    except cv2.error:
-        # Otsu's method can fail on images with no contrast (e.g., all black/white)
-        return image
-
-    # Find the outermost contours
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if not contours:
-        return image  # No content found
-
-    # Find the largest contour by area, which we assume is the page
-    largest_contour = max(contours, key=cv2.contourArea)
+    
+    # Try multiple thresholding approaches for better robustness
+    # For fine cropping (high min_area_ratio), prefer Otsu which works better for eliminating table background
+    if min_area_ratio >= 0.5:  # Fine crop - be more conservative
+        methods = [
+            ("otsu", lambda: cv2.threshold(cv2.GaussianBlur(gray, (11, 11), 0), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),
+            ("fixed_threshold", lambda: cv2.threshold(cv2.GaussianBlur(gray, (11, 11), 0), 140, 255, cv2.THRESH_BINARY)[1])
+        ]
+    else:  # Coarse crop - be more inclusive to detect full book
+        methods = [
+            ("otsu", lambda: cv2.threshold(cv2.GaussianBlur(gray, (11, 11), 0), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),
+            ("adaptive_mean", lambda: cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, 10)),
+            ("adaptive_gaussian", lambda: cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 10)),
+            ("fixed_threshold", lambda: cv2.threshold(cv2.GaussianBlur(gray, (11, 11), 0), 140, 255, cv2.THRESH_BINARY)[1])
+        ]
+    
+    best_contour = None
+    best_area = 0
+    best_method = None
+    
+    for method_name, threshold_func in methods:
+        try:
+            thresh = threshold_func()
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if contours:
+                largest_contour = max(contours, key=cv2.contourArea)
+                area = cv2.contourArea(largest_contour)
+                area_ratio = area / original_area
+                
+                # Prefer contours that cover a reasonable portion of the image
+                if area_ratio >= min_area_ratio and area > best_area:
+                    best_contour = largest_contour
+                    best_area = area
+                    best_method = method_name
+                    
+        except cv2.error:
+            # Skip this method if it fails
+            continue
+    
+    # Fallback to original method if no good contour found
+    if best_contour is None:
+        # Use original Otsu method as last resort
+        try:
+            blurred = cv2.GaussianBlur(gray, (11, 11), 0)
+            _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if contours:
+                best_contour = max(contours, key=cv2.contourArea)
+            else:
+                return image
+        except cv2.error:
+            return image
 
     # Get the bounding box for the page
-    x, y, w, h = cv2.boundingRect(largest_contour)
+    x, y, w, h = cv2.boundingRect(best_contour)
 
     # Apply padding to the bounding box
     x_start = max(x - padding, 0)
@@ -255,7 +291,8 @@ def process_image(image_path: Path, output_dir: Path, logger: logging.Logger,
 
         # Step 4: Coarse crop - Isolate the book from the background (e.g., the table)
         # We use a larger padding here to ensure we don't clip the book itself.
-        book_image = crop_to_content(deskewed_image, padding=50)
+        # Use lower min_area_ratio for better detection of complete book
+        book_image = crop_to_content(deskewed_image, padding=50, min_area_ratio=0.25)
         
         # Step 5: Split the cropped book image into left and right pages
         # We apply a small offset to the right to ensure the split avoids the book's spine.
@@ -263,8 +300,9 @@ def process_image(image_path: Path, output_dir: Path, logger: logging.Logger,
         
         # Step 6: Fine crop - Tightly crop each page to its text content
         # A smaller, standard padding is used here for a clean final result.
-        final_left_page = crop_to_content(left_page)
-        final_right_page = crop_to_content(right_page)
+        # Use stricter parameters to eliminate table background from individual pages
+        final_left_page = crop_to_content(left_page, padding=20, min_area_ratio=0.5)
+        final_right_page = crop_to_content(right_page, padding=20, min_area_ratio=0.5)
 
         # Step 7: Enhance image quality for better text readability (optional)
         if enhance_quality:
