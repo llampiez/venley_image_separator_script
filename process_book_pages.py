@@ -3,16 +3,53 @@ import cv2
 import logging
 import numpy as np
 import os
-import rawpy
+# rawpy import moved to be conditional
 from pathlib import Path
 from typing import Tuple, Dict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
+from PIL import Image, ImageEnhance
 
-def load_image(filepath: Path) -> np.ndarray:
+# Import canon_cr3 wrapper for comparison
+try:
+    from canon_cr3_wrapper import convert_cr3_to_jpg_canon_cr3
+    CANON_CR3_AVAILABLE = True
+except ImportError:
+    CANON_CR3_AVAILABLE = False
+
+# Global variable to track if rawpy is available
+RAWPY_AVAILABLE = False
+try:
+    import rawpy
+    RAWPY_AVAILABLE = True
+except ImportError:
+    RAWPY_AVAILABLE = False
+
+def load_image(filepath: Path, use_canon_cr3: bool = False) -> np.ndarray:
     """Loads an image from the specified file path, converting RAW formats if necessary."""
     try:
         if filepath.suffix.lower() in ['.cr3', '.nef', '.arw', '.dng']:
+            if use_canon_cr3 and CANON_CR3_AVAILABLE and filepath.suffix.lower() == '.cr3':
+                # Try using canon_cr3 for CR3 files
+                temp_jpg = filepath.parent / f"temp_{filepath.stem}.jpg"
+                try:
+                    if convert_cr3_to_jpg_canon_cr3(filepath, temp_jpg):
+                        image = cv2.imread(str(temp_jpg))
+                        # Clean up temporary file
+                        if temp_jpg.exists():
+                            temp_jpg.unlink()
+                        if image is not None:
+                            return image
+                except Exception as e:
+                    # If canon_cr3 fails, fall back to rawpy
+                    if temp_jpg.exists():
+                        temp_jpg.unlink()
+                    print(f"Warning: canon_cr3 conversion failed for {filepath}, falling back to rawpy: {e}")
+            
+            # Use rawpy (default method)
+            if not RAWPY_AVAILABLE:
+                raise ImportError("rawpy not available and canon_cr3 conversion failed")
+            
             with rawpy.imread(str(filepath)) as raw:
                 # Post-process to get an RGB image, then convert to BGR for OpenCV
                 rgb = raw.postprocess(use_camera_wb=True)
@@ -74,37 +111,73 @@ def deskew_image(image: np.ndarray, threshold: float = 1.0) -> np.ndarray:
     
     return image
 
-def crop_to_content(image: np.ndarray, padding: int = 20) -> np.ndarray:
+def crop_to_content(image: np.ndarray, padding: int = 20, min_area_ratio: float = 0.3) -> np.ndarray:
     """
-    Finds the largest bright object (the page) and crops the image to its
-    bounding box, leaving a small padding. This is effective at removing
-    dark backgrounds like a table.
+    Improved version that finds the largest bright object (the page) and crops the image to its
+    bounding box, leaving a small padding. Uses multiple thresholding methods for robustness.
     """
     if image is None:
         return None
 
+    original_area = image.shape[0] * image.shape[1]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    # Use a larger blur kernel to smooth out text and focus on the page shape
-    blurred = cv2.GaussianBlur(gray, (11, 11), 0)
-
-    # Use Otsu's thresholding to automatically separate the bright page from the dark background
-    try:
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    except cv2.error:
-        # Otsu's method can fail on images with no contrast (e.g., all black/white)
-        return image
-
-    # Find the outermost contours
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if not contours:
-        return image  # No content found
-
-    # Find the largest contour by area, which we assume is the page
-    largest_contour = max(contours, key=cv2.contourArea)
+    
+    # Try multiple thresholding approaches for better robustness
+    # For fine cropping (high min_area_ratio), prefer Otsu which works better for eliminating table background
+    if min_area_ratio >= 0.5:  # Fine crop - be more conservative
+        methods = [
+            ("otsu", lambda: cv2.threshold(cv2.GaussianBlur(gray, (11, 11), 0), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),
+            ("fixed_threshold", lambda: cv2.threshold(cv2.GaussianBlur(gray, (11, 11), 0), 140, 255, cv2.THRESH_BINARY)[1])
+        ]
+    else:  # Coarse crop - be more inclusive to detect full book
+        methods = [
+            ("otsu", lambda: cv2.threshold(cv2.GaussianBlur(gray, (11, 11), 0), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),
+            ("adaptive_mean", lambda: cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, 10)),
+            ("adaptive_gaussian", lambda: cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 10)),
+            ("fixed_threshold", lambda: cv2.threshold(cv2.GaussianBlur(gray, (11, 11), 0), 140, 255, cv2.THRESH_BINARY)[1])
+        ]
+    
+    best_contour = None
+    best_area = 0
+    best_method = None
+    
+    for method_name, threshold_func in methods:
+        try:
+            thresh = threshold_func()
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if contours:
+                largest_contour = max(contours, key=cv2.contourArea)
+                area = cv2.contourArea(largest_contour)
+                area_ratio = area / original_area
+                
+                # Prefer contours that cover a reasonable portion of the image
+                if area_ratio >= min_area_ratio and area > best_area:
+                    best_contour = largest_contour
+                    best_area = area
+                    best_method = method_name
+                    
+        except cv2.error:
+            # Skip this method if it fails
+            continue
+    
+    # Fallback to original method if no good contour found
+    if best_contour is None:
+        # Use original Otsu method as last resort
+        try:
+            blurred = cv2.GaussianBlur(gray, (11, 11), 0)
+            _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if contours:
+                best_contour = max(contours, key=cv2.contourArea)
+            else:
+                return image
+        except cv2.error:
+            return image
 
     # Get the bounding box for the page
-    x, y, w, h = cv2.boundingRect(largest_contour)
+    x, y, w, h = cv2.boundingRect(best_contour)
 
     # Apply padding to the bounding box
     x_start = max(x - padding, 0)
@@ -118,6 +191,43 @@ def crop_to_content(image: np.ndarray, padding: int = 20) -> np.ndarray:
     if cropped.shape[0] > 0 and cropped.shape[1] > 0:
         return cropped
     else:
+        return image
+
+def enhance_page_quality(image: np.ndarray, sharpness: float = 1.3, contrast: float = 1.2, blur_kernel: int = 3) -> np.ndarray:
+    """
+    Enhances page quality by applying sharpness and contrast improvements.
+    Optimized for book pages to improve text readability.
+    """
+    if image is None:
+        return None
+    
+    try:
+        # Convert OpenCV BGR to PIL RGB
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(image_rgb)
+        
+        # Apply slight gaussian blur to reduce noise
+        if blur_kernel > 0:
+            image_bgr = cv2.GaussianBlur(image, (blur_kernel, blur_kernel), 0)
+            image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(image_rgb)
+        
+        # Enhance sharpness
+        enhancer = ImageEnhance.Sharpness(pil_image)
+        sharp_image = enhancer.enhance(sharpness)
+        
+        # Enhance contrast
+        enhancer = ImageEnhance.Contrast(sharp_image)
+        final_image = enhancer.enhance(contrast)
+        
+        # Convert back to OpenCV BGR
+        final_array = np.array(final_image)
+        final_bgr = cv2.cvtColor(final_array, cv2.COLOR_RGB2BGR)
+        
+        return final_bgr
+        
+    except Exception as e:
+        # If enhancement fails, return original image
         return image
 
 def split_pages(image: np.ndarray, offset_percentage: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
@@ -155,14 +265,25 @@ def save_pages(left_page: np.ndarray, right_page: np.ndarray, output_dir: Path, 
     except Exception as e:
         raise IOError(f"Error saving pages for {filename}: {e}")
 
-def process_image(image_path: Path, output_dir: Path, logger: logging.Logger):
+def process_image(image_path: Path, output_dir: Path, logger: logging.Logger, 
+                  use_canon_cr3: bool = False, enhance_quality: bool = True, 
+                  sharpness: float = 1.3, contrast: float = 1.2):
     """
     Processes an image using a two-phase cropping approach for best results.
-    Full pipeline: load -> rotate -> deskew -> coarse crop -> split -> fine crop -> save.
+    Full pipeline: load -> rotate -> deskew -> coarse crop -> split -> fine crop -> enhance -> save.
+    
+    Args:
+        image_path: Path to the input image
+        output_dir: Directory to save processed images
+        logger: Logger instance for error reporting
+        use_canon_cr3: Whether to use canon_cr3 for CR3 files instead of rawpy
+        enhance_quality: Whether to apply quality enhancement (default: True)
+        sharpness: Sharpness factor for enhancement
+        contrast: Contrast factor for enhancement
     """
     try:
         # Steps 1 & 2: Load the image and correct its orientation
-        image = load_image(image_path)
+        image = load_image(image_path, use_canon_cr3=use_canon_cr3)
         image = cv2.rotate(image, cv2.ROTATE_180)
         
         # Step 3: Deskew the entire image to align the text horizontally
@@ -170,7 +291,8 @@ def process_image(image_path: Path, output_dir: Path, logger: logging.Logger):
 
         # Step 4: Coarse crop - Isolate the book from the background (e.g., the table)
         # We use a larger padding here to ensure we don't clip the book itself.
-        book_image = crop_to_content(deskewed_image, padding=50)
+        # Use lower min_area_ratio for better detection of complete book
+        book_image = crop_to_content(deskewed_image, padding=50, min_area_ratio=0.25)
         
         # Step 5: Split the cropped book image into left and right pages
         # We apply a small offset to the right to ensure the split avoids the book's spine.
@@ -178,19 +300,38 @@ def process_image(image_path: Path, output_dir: Path, logger: logging.Logger):
         
         # Step 6: Fine crop - Tightly crop each page to its text content
         # A smaller, standard padding is used here for a clean final result.
-        final_left_page = crop_to_content(left_page)
-        final_right_page = crop_to_content(right_page)
+        # Use stricter parameters to eliminate table background from individual pages
+        final_left_page = crop_to_content(left_page, padding=20, min_area_ratio=0.5)
+        final_right_page = crop_to_content(right_page, padding=20, min_area_ratio=0.5)
 
-        # Step 7: Save the processed pages
-        save_pages(final_left_page, final_right_page, output_dir, image_path.name)
+        # Step 7: Enhance image quality for better text readability (optional)
+        if enhance_quality:
+            # Apply sharpness and contrast improvements optimized for book pages
+            enhanced_left_page = enhance_page_quality(final_left_page, sharpness=sharpness, contrast=contrast)
+            enhanced_right_page = enhance_page_quality(final_right_page, sharpness=sharpness, contrast=contrast)
+        else:
+            enhanced_left_page = final_left_page
+            enhanced_right_page = final_right_page
+
+        # Step 8: Save the processed and enhanced pages
+        save_pages(enhanced_left_page, enhanced_right_page, output_dir, image_path.name)
         return True
     except Exception as e:
         logger.error(f"Failed to process {image_path.name}: {e}")
         return False
 
-def process_batch(batch_dir: Path, workers: int = 4) -> Dict[str, int]:
+def process_batch(batch_dir: Path, workers: int = 4, use_canon_cr3: bool = False, 
+                  enhance_quality: bool = True, sharpness: float = 1.3, contrast: float = 1.2) -> Dict[str, int]:
     """
     Processes a batch of images in parallel.
+    
+    Args:
+        batch_dir: Directory containing the batch to process
+        workers: Number of parallel workers to use
+        use_canon_cr3: Whether to use canon_cr3 for CR3 files instead of rawpy
+        enhance_quality: Whether to apply quality enhancement
+        sharpness: Sharpness factor for enhancement
+        contrast: Contrast factor for enhancement
     """
     input_dir = batch_dir / "imagenes_juntas"
     output_dir = batch_dir / "imagenes_separadas"
@@ -220,7 +361,7 @@ def process_batch(batch_dir: Path, workers: int = 4) -> Dict[str, int]:
     error_count = 0
     
     with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(process_image, image_path, output_dir, logger): image_path for image_path in image_files}
+        futures = {executor.submit(process_image, image_path, output_dir, logger, use_canon_cr3, enhance_quality, sharpness, contrast): image_path for image_path in image_files}
         
         with tqdm(total=len(image_files), desc=f"Processing Batch: {batch_dir.name}") as pbar:
             for future in as_completed(futures):
@@ -242,16 +383,43 @@ def main() -> None:
     
     Usage:
     
-    Process a single batch:
+    Process a single batch with rawpy (default, recommended):
     python process_book_pages.py --path /path/to/contenedor/lote_X
+    
+    Process using canon_cr3 library for comparison:
+    python process_book_pages.py --path /path/to/contenedor/lote_X --use-canon-cr3
     
     Process all batches in the container:
     python process_book_pages.py --path /path/to/contenedor
+    
+    Process without quality enhancement:
+    python process_book_pages.py --path /path/to/contenedor/lote_X --no-enhance
+    
+    Process with custom enhancement settings:
+    python process_book_pages.py --path /path/to/contenedor/lote_X --sharpness 1.5 --contrast 1.3
     """
     parser = argparse.ArgumentParser(description="Batch process book page images.")
     parser.add_argument("--path", type=Path, required=True, help="Path to a batch directory or a container of batches.")
     parser.add_argument("--workers", type=int, default=os.cpu_count(), help="Number of worker processes to use.")
+    
+    # Library selection
+    parser.add_argument("--use-canon-cr3", action="store_true", help="Use canon_cr3 library for CR3 files instead of rawpy (experimental).")
+    
+    # Quality enhancement options
+    parser.add_argument("--enhance", action="store_true", default=True, help="Enable quality enhancement (default: True).")
+    parser.add_argument("--no-enhance", action="store_true", help="Disable quality enhancement.")
+    parser.add_argument("--sharpness", type=float, default=1.3, help="Sharpness factor for enhancement (default: 1.3).")
+    parser.add_argument("--contrast", type=float, default=1.2, help="Contrast factor for enhancement (default: 1.2).")
+    
     args = parser.parse_args()
+    
+    # Handle enhancement flags
+    enhance_quality = args.enhance and not args.no_enhance
+    
+    # Check canon_cr3 availability if requested
+    if args.use_canon_cr3 and not CANON_CR3_AVAILABLE:
+        print("Warning: canon_cr3 library not available. Falling back to rawpy.")
+        args.use_canon_cr3 = False
 
     if not args.path.exists():
         print(f"Error: The path {args.path} does not exist.")
@@ -260,16 +428,26 @@ def main() -> None:
     total_processed = 0
     total_errors = 0
     
+    # Print configuration
+    print(f"Configuration:")
+    print(f"  Workers: {args.workers}")
+    print(f"  Library: {'canon_cr3' if args.use_canon_cr3 else 'rawpy'}")
+    print(f"  Quality enhancement: {'Yes' if enhance_quality else 'No'}")
+    if enhance_quality:
+        print(f"  Sharpness: {args.sharpness}")
+        print(f"  Contrast: {args.contrast}")
+    print()
+    
     if args.path.name.startswith("lote_"):
         # Process a single batch
-        stats = process_batch(args.path, args.workers)
+        stats = process_batch(args.path, args.workers, args.use_canon_cr3, enhance_quality, args.sharpness, args.contrast)
         total_processed += stats["processed"]
         total_errors += stats["errors"]
     else:
         # Process all batches in the container
         batch_dirs = [d for d in args.path.iterdir() if d.is_dir() and d.name.startswith("lote_")]
         for batch_dir in batch_dirs:
-            stats = process_batch(batch_dir, args.workers)
+            stats = process_batch(batch_dir, args.workers, args.use_canon_cr3, enhance_quality, args.sharpness, args.contrast)
             total_processed += stats["processed"]
             total_errors += stats["errors"]
             
