@@ -17,10 +17,7 @@ import cv2
 from PIL import Image as PILImage
 import logging
 
-# Add the temp_canon_cr3 directory to path to import modules
-sys.path.insert(0, str(Path(__file__).parent / "temp_canon_cr3"))
-
-# Import the necessary modules
+# Import the necessary modules (now in the same directory)
 try:
     from CRaw3.TiffIfd import TiffIfd
     from CRaw3.Jpeg import Jpeg      
